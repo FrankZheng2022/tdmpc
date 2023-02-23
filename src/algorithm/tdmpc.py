@@ -11,9 +11,12 @@ class TOLD(nn.Module):
 		super().__init__()
 		self.cfg = cfg
 		self._encoder = h.enc(cfg)
-		self._dynamics = h.mlp(cfg.latent_dim+cfg.action_dim, cfg.mlp_dim, cfg.latent_dim)
-		self._reward = h.mlp(cfg.latent_dim+cfg.action_dim, cfg.mlp_dim, 1)
-		self._pi = h.mlp(cfg.latent_dim, cfg.mlp_dim, cfg.action_dim)
+		self._action_encoder = h.mlp(cfg.action_dim, cfg.mlp_dim, cfg.latent_action_dim)
+		self._action_decoder = h.mlp(cfg.latent_action_dim + cfg.latent_dim, cfg.mlp_dim, cfg.action_dim)
+		self._dynamics = h.mlp(cfg.latent_dim+cfg.latent_action_dim, cfg.mlp_dim, cfg.latent_dim)
+		self._inverse_dynamics = h.mlp(cfg.latent_dim*2, cfg.mlp_dim, cfg.latent_action_dim)
+		self._reward = h.mlp(cfg.latent_dim+cfg.latent_action_dim, cfg.mlp_dim, 1)
+		self._pi = h.mlp(cfg.latent_dim, cfg.mlp_dim, cfg.latent_action_dim)
 		self._Q1, self._Q2 = h.q(cfg), h.q(cfg)
 		self.apply(h.orthogonal_init)
 		for m in [self._reward, self._Q1, self._Q2]:
@@ -29,11 +32,16 @@ class TOLD(nn.Module):
 		"""Encodes an observation into its latent representation (h)."""
 		return self._encoder(obs)
 
-	def next(self, z, a):
+	def next(self, z, u):
 		"""Predicts next latent state (d) and single-step reward (R)."""
-		x = torch.cat([z, a], dim=-1)
+		x = torch.cat([z, u], dim=-1)
 		return self._dynamics(x), self._reward(x)
-
+    
+	def prev_act(self, prev_z, z):
+		"""Predicts previous latent action"""
+		x = torch.cat([prev_z, z], dim=-1)
+		return self._inverse_dynamics(x)
+    
 	def pi(self, z, std=0):
 		"""Samples an action from the learned policy (pi)."""
 		mu = torch.tanh(self._pi(z))
@@ -42,12 +50,16 @@ class TOLD(nn.Module):
 			return h.TruncatedNormal(mu, std).sample(clip=0.3)
 		return mu
 
-	def Q(self, z, a):
-		"""Predict state-action value (Q)."""
-		x = torch.cat([z, a], dim=-1)
+	def Q(self, z, u):
+		"""Predict state-action value (Q)."""  
+		x = torch.cat([z, u], dim=-1)
 		return self._Q1(x), self._Q2(x)
 
-
+	def decode_action(self, z, u):
+		"""Return Raw Action"""  
+		x = torch.cat([z, u], dim=-1)
+		return self._action_decoder(x)
+    
 class TDMPC():
 	"""Implementation of TD-MPC learning + inference."""
 	def __init__(self, cfg):
@@ -97,16 +109,16 @@ class TDMPC():
 		step: current time step. determines e.g. planning horizon.
 		t0: whether current step is the first step of an episode.
 		"""
+		obs = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
 		# Seed steps
 		if step < self.cfg.seed_steps and not eval_mode:
-			return torch.empty(self.cfg.action_dim, dtype=torch.float32, device=self.device).uniform_(-1, 1)
+			return self.model.decode_action(self.model.h(obs.squeeze(0)), torch.empty(self.cfg.latent_action_dim, dtype=torch.float32, device=self.device).uniform_(-1, 1))
 
 		# Sample policy trajectories
-		obs = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
 		horizon = int(min(self.cfg.horizon, h.linear_schedule(self.cfg.horizon_schedule, step)))
 		num_pi_trajs = int(self.cfg.mixture_coef * self.cfg.num_samples)
 		if num_pi_trajs > 0:
-			pi_actions = torch.empty(horizon, num_pi_trajs, self.cfg.action_dim, device=self.device)
+			pi_actions = torch.empty(horizon, num_pi_trajs, self.cfg.latent_action_dim, device=self.device)
 			z = self.model.h(obs).repeat(num_pi_trajs, 1)
 			for t in range(horizon):
 				pi_actions[t] = self.model.pi(z, self.cfg.min_std)
@@ -114,15 +126,15 @@ class TDMPC():
 
 		# Initialize state and parameters
 		z = self.model.h(obs).repeat(self.cfg.num_samples+num_pi_trajs, 1)
-		mean = torch.zeros(horizon, self.cfg.action_dim, device=self.device)
-		std = 2*torch.ones(horizon, self.cfg.action_dim, device=self.device)
+		mean = torch.zeros(horizon, self.cfg.latent_action_dim, device=self.device)
+		std = 2*torch.ones(horizon, self.cfg.latent_action_dim, device=self.device)
 		if not t0 and hasattr(self, '_prev_mean'):
 			mean[:-1] = self._prev_mean[1:]
 
 		# Iterate CEM
 		for i in range(self.cfg.iterations):
 			actions = torch.clamp(mean.unsqueeze(1) + std.unsqueeze(1) * \
-				torch.randn(horizon, self.cfg.num_samples, self.cfg.action_dim, device=std.device), -1, 1)
+				torch.randn(horizon, self.cfg.num_samples, self.cfg.latent_action_dim, device=std.device), -1, 1)
 			if num_pi_trajs > 0:
 				actions = torch.cat([actions, pi_actions], dim=1)
 
@@ -147,8 +159,8 @@ class TDMPC():
 		mean, std = actions[0], _std[0]
 		a = mean
 		if not eval_mode:
-			a += std * torch.randn(self.cfg.action_dim, device=std.device)
-		return a
+			a += std * torch.randn(self.cfg.latent_action_dim, device=std.device)
+		return self.model.decode_action(self.model.h(obs.squeeze(0)), a)
 
 	def update_pi(self, zs):
 		"""Update policy using a sequence of latent states."""
@@ -178,7 +190,7 @@ class TDMPC():
 
 	def update(self, replay_buffer, step):
 		"""Main update function. Corresponds to one iteration of the TOLD model learning."""
-		obs, next_obses, action, reward, idxs, weights = replay_buffer.sample()
+		obs, obses, next_obses, action, reward, idxs, weights = replay_buffer.sample()
 		self.optim.zero_grad(set_to_none=True)
 		self.std = h.linear_schedule(self.cfg.std_schedule, step)
 		self.model.train()
@@ -187,29 +199,39 @@ class TDMPC():
 		z = self.model.h(self.aug(obs))
 		zs = [z.detach()]
 
-		consistency_loss, reward_loss, value_loss, priority_loss = 0, 0, 0, 0
+		inv_consistency_loss, act_reconstruct_loss, consistency_loss, reward_loss, value_loss, priority_loss = 0, 0, 0, 0, 0, 0
 		for t in range(self.cfg.horizon):
 
 			# Predictions
-			Q1, Q2 = self.model.Q(z, action[t])
-			z, reward_pred = self.model.next(z, action[t])
-			with torch.no_grad():
+			u = self.model._action_encoder(action[t])
+			Q1, Q2 = self.model.Q(z, u)
+			z, reward_pred = self.model.next(z, u)
+			with torch.no_grad():                
 				next_obs = self.aug(next_obses[t])
 				next_z = self.model_target.h(next_obs)
 				td_target = self._td_target(next_obs, reward[t])
+				z1, z2 = self.model_target.h(obses[t]), self.model_target.h(next_obses[t])
 			zs.append(z.detach())
+			u_predict = self.model.prev_act(z1, z2)
+			action_reconstruct = self.model.decode_action(z1, u)
 
 			# Losses
 			rho = (self.cfg.rho ** t)
 			consistency_loss += rho * torch.mean(h.mse(z, next_z), dim=1, keepdim=True)
+			inv_consistency_loss += rho * torch.mean(h.mse(u_predict, u), dim=1, keepdim=True)
+			act_reconstruct_loss += rho * torch.mean(h.mse(action[t], action_reconstruct), dim=1, keepdim=True)
 			reward_loss += rho * h.mse(reward_pred, reward[t])
 			value_loss += rho * (h.mse(Q1, td_target) + h.mse(Q2, td_target))
 			priority_loss += rho * (h.l1(Q1, td_target) + h.l1(Q2, td_target))
-
 		# Optimize model
+		#print(self.cfg.consistency_coef, self.cfg.reward_coef, self.cfg.value_coef, self.cfg.act_reconstruct_coef, self.cfg.inv_consistency_coef)
+		#print(consistency_loss.shape, reward_loss.shape, value_loss.shape, act_reconstruct_loss.shape, inv_consistency_loss.shape)
 		total_loss = self.cfg.consistency_coef * consistency_loss.clamp(max=1e4) + \
 					 self.cfg.reward_coef * reward_loss.clamp(max=1e4) + \
-					 self.cfg.value_coef * value_loss.clamp(max=1e4)
+					 self.cfg.value_coef * value_loss.clamp(max=1e4)+ \
+					 self.cfg.act_reconstruct_coef * act_reconstruct_loss + \
+					 self.cfg.inv_consistency_coef * inv_consistency_loss \
+                
 		weighted_loss = (total_loss.squeeze(1) * weights).mean()
 		weighted_loss.register_hook(lambda grad: grad * (1/self.cfg.horizon))
 		weighted_loss.backward()
@@ -224,9 +246,12 @@ class TDMPC():
 
 		self.model.eval()
 		return {'consistency_loss': float(consistency_loss.mean().item()),
+				'inverse_consistency_loss': float(inv_consistency_loss.mean().item()),
+				'action_reconstruction_loss': float(act_reconstruct_loss.mean().item()),
 				'reward_loss': float(reward_loss.mean().item()),
 				'value_loss': float(value_loss.mean().item()),
 				'pi_loss': pi_loss,
 				'total_loss': float(total_loss.mean().item()),
 				'weighted_loss': float(weighted_loss.mean().item()),
-				'grad_norm': float(grad_norm)}
+				'grad_norm': float(grad_norm),
+                }

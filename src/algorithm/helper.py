@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import distributions as pyd
 from torch.distributions.utils import _standard_normal
-
+import os
 
 __REDUCE__ = lambda b: 'mean' if b else 'none'
 
@@ -123,7 +123,7 @@ def mlp(in_dim, mlp_dim, out_dim, act_fn=nn.ELU()):
 
 def q(cfg, act_fn=nn.ELU()):
 	"""Returns a Q-function that uses Layer Normalization."""
-	return nn.Sequential(nn.Linear(cfg.latent_dim+cfg.action_dim, cfg.mlp_dim), nn.LayerNorm(cfg.mlp_dim), nn.Tanh(),
+	return nn.Sequential(nn.Linear(cfg.latent_dim+cfg.latent_action_dim, cfg.mlp_dim), nn.LayerNorm(cfg.mlp_dim), nn.Tanh(),
 						 nn.Linear(cfg.mlp_dim, cfg.mlp_dim), nn.ELU(),
 						 nn.Linear(cfg.mlp_dim, 1))
 
@@ -197,7 +197,7 @@ class ReplayBuffer():
 	def __init__(self, cfg):
 		self.cfg = cfg
 		self.device = torch.device(cfg.device)
-		self.capacity = min(cfg.train_steps, cfg.max_buffer_size)
+		self.capacity = min(cfg.max_buffer_size, cfg.train_steps)
 		dtype = torch.float32 if cfg.modality == 'state' else torch.uint8
 		obs_shape = cfg.obs_shape if cfg.modality == 'state' else (3, *cfg.obs_shape[-2:])
 		self._obs = torch.empty((self.capacity+1, *obs_shape), dtype=dtype, device=self.device)
@@ -256,10 +256,12 @@ class ReplayBuffer():
 		obs = self._get_obs(self._obs, idxs)
 		next_obs_shape = self._last_obs.shape[1:] if self.cfg.modality == 'state' else (3*self.cfg.frame_stack, *self._last_obs.shape[-2:])
 		next_obs = torch.empty((self.cfg.horizon+1, self.cfg.batch_size, *next_obs_shape), dtype=obs.dtype, device=obs.device)
+		obses = torch.empty((self.cfg.horizon+1, self.cfg.batch_size, *next_obs_shape), dtype=obs.dtype, device=obs.device)
 		action = torch.empty((self.cfg.horizon+1, self.cfg.batch_size, *self._action.shape[1:]), dtype=torch.float32, device=self.device)
 		reward = torch.empty((self.cfg.horizon+1, self.cfg.batch_size), dtype=torch.float32, device=self.device)
 		for t in range(self.cfg.horizon+1):
 			_idxs = idxs + t
+			obses[t] = self._get_obs(self._obs, _idxs) 
 			next_obs[t] = self._get_obs(self._obs, _idxs+1)
 			action[t] = self._action[_idxs]
 			reward[t] = self._reward[_idxs]
@@ -270,9 +272,76 @@ class ReplayBuffer():
 			action, reward, idxs, weights = \
 				action.cuda(), reward.cuda(), idxs.cuda(), weights.cuda()
 
-		return obs, next_obs, action, reward.unsqueeze(2), idxs, weights
+		return obs, obses, next_obs, action, reward.unsqueeze(2), idxs, weights
 
 
+class FullReplayBuffer(object):
+    """Buffer to store environment transitions."""
+    def __init__(self, capacity, obs_shape, action_shape, pixel_shape=(3,84, 84)):
+        self.capacity = capacity
+
+        # the proprioceptive obs is stored as float32, pixels obs as uint8
+        obs_dtype = np.float32 if len(obs_shape) == 1 else np.uint8
+
+        self.obses = np.empty((capacity, *obs_shape), dtype=obs_dtype)
+        self.next_obses = np.empty((capacity, *obs_shape), dtype=obs_dtype)
+        self.actions = np.empty((capacity, *action_shape), dtype=np.float32)
+        self.rewards = np.empty((capacity, 1), dtype=np.float32)
+        self.not_dones = np.empty((capacity, 1), dtype=np.float32)
+
+        #self.states = np.empty((capacity, *state_shape), dtype=np.float32)
+        self.pixels = np.empty((capacity, *pixel_shape), dtype=np.uint8)
+
+        self.idx = 0
+        self.last_save = 0
+        self.full = False
+
+    def add(self, obs, action, reward, next_obs, done, pixel):
+        np.copyto(self.obses[self.idx], obs)
+        np.copyto(self.actions[self.idx], action)
+        np.copyto(self.rewards[self.idx], reward)
+        np.copyto(self.next_obses[self.idx], next_obs)
+        np.copyto(self.not_dones[self.idx], not done)
+
+        #np.copyto(self.states[self.idx], state)
+        np.copyto(self.pixels[self.idx], pixel)
+
+        self.idx = (self.idx + 1) % self.capacity
+        self.full = self.full or self.idx == 0
+
+    def save(self, save_dir):
+        if self.idx == self.last_save:
+            return
+        path = os.path.join(save_dir, '%d_%d.pt' % (self.last_save, self.idx))
+        payload = [
+            self.obses[self.last_save:self.idx],
+            self.next_obses[self.last_save:self.idx],
+            self.actions[self.last_save:self.idx],
+            self.rewards[self.last_save:self.idx],
+            self.not_dones[self.last_save:self.idx],
+            #self.states[self.last_save:self.idx],
+            self.pixels[self.last_save:self.idx],
+        ]
+        self.last_save = self.idx
+        torch.save(payload, path)
+
+    def load(self, save_dir):
+        chunks = os.listdir(save_dir)
+        chucks = sorted(chunks, key=lambda x: int(x.split('_')[0]))
+        for chunk in chucks:
+            start, end = [int(x) for x in chunk.split('.')[0].split('_')]
+            path = os.path.join(save_dir, chunk)
+            payload = torch.load(path)
+            assert self.idx == start
+            self.obses[start:end] = payload[0]
+            self.next_obses[start:end] = payload[1]
+            self.actions[start:end] = payload[2]
+            self.rewards[start:end] = payload[3]
+            self.not_dones[start:end] = payload[4]
+            #self.states[start:end] = payload[5]
+            self.pixels[start:end] = payload[6]
+            self.idx = end
+    
 def linear_schedule(schdl, step):
 	"""
 	Outputs values following a linear decay schedule.

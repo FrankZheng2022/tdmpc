@@ -53,7 +53,7 @@ def cfg_to_group(cfg, return_list=False):
 class VideoRecorder:
 	"""Utility class for logging evaluation videos."""
 	def __init__(self, root_dir, wandb, render_size=384, fps=15):
-		self.save_dir = (root_dir / 'eval_video') if root_dir else None
+		self.save_dir = os.path.join(root_dir, 'eval_video') if root_dir else None
 		self._wandb = wandb
 		self.render_size = render_size
 		self.fps = fps
@@ -80,7 +80,7 @@ class Logger(object):
 	"""Primary logger object. Logs either locally or using wandb."""
 	def __init__(self, log_dir, cfg):
 		self._log_dir = make_dir(log_dir)
-		self._model_dir = make_dir(self._log_dir / 'models')
+		self._model_dir = make_dir(os.path.join(self._log_dir, 'models'))
 		self._save_model = cfg.save_model
 		self._group = cfg_to_group(cfg)
 		self._seed = cfg.seed
@@ -116,7 +116,7 @@ class Logger(object):
 
 	def finish(self, agent):
 		if self._save_model:
-			fp = self._model_dir / f'model.pt'
+			fp = os.path.join(self._model_dir, f'model.pt')
 			torch.save(agent.state_dict(), fp)
 			if self._wandb:
 				artifact = self._wandb.Artifact(self._group+'-'+str(self._seed), type='model')
@@ -125,6 +125,10 @@ class Logger(object):
 		if self._wandb:
 			self._wandb.finish()
 		print_run(self._cfg, self._eval[-1][-1])
+        
+	def save(self, agent):
+		fp = os.path.join(self._model_dir, f'model.pt')
+		torch.save(agent.state_dict(), fp)
 
 	def _format(self, key, value, ty):
 		if ty == 'int':
@@ -142,7 +146,7 @@ class Logger(object):
 		pieces = [f' {category:<14}']
 		for k, disp_k, ty in CONSOLE_FORMAT:
 			pieces.append(f'{self._format(disp_k, d.get(k, 0), ty):<26}')
-		print('   '.join(pieces))
+		print('   '.join(pieces), flush=True)
 
 	def log(self, d, category='train'):
 		assert category in {'train', 'eval'}
@@ -152,5 +156,5 @@ class Logger(object):
 		if category == 'eval':
 			keys = ['env_step', 'episode_reward']
 			self._eval.append(np.array([d[keys[0]], d[keys[1]]]))
-			pd.DataFrame(np.array(self._eval)).to_csv(self._log_dir / 'eval.log', header=keys, index=None)
+			pd.DataFrame(np.array(self._eval)).to_csv(os.path.join(self._log_dir, 'eval_{}.log'.format(self._cfg.exp_name)), header=keys, index=None)
 		self._print(d, category)

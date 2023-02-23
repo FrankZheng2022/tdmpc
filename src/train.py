@@ -13,8 +13,9 @@ from pathlib import Path
 from cfg import parse_cfg
 from env import make_env
 from algorithm.tdmpc import TDMPC
-from algorithm.helper import Episode, ReplayBuffer
+from algorithm.helper import Episode, ReplayBuffer, FullReplayBuffer
 import logger
+from logger import make_dir
 torch.backends.cudnn.benchmark = True
 __CONFIG__, __LOGS__ = 'cfgs', 'logs'
 
@@ -47,12 +48,20 @@ def train(cfg):
 	"""Training script for TD-MPC. Requires a CUDA-enabled device."""
 	assert torch.cuda.is_available()
 	set_seed(cfg.seed)
-	work_dir = Path().cwd() / __LOGS__ / cfg.task / cfg.modality / cfg.exp_name / str(cfg.seed)
+	if cfg.amlt == 1:
+		log_dir    = os.path.join(os.environ['AMLT_OUTPUT_DIR'], cfg.exp_name)
+		buffer_dir = os.path.join(os.environ['AMLT_OUTPUT_DIR'], cfg.exp_name, 'buffer')
+		make_dir(buffer_dir)
+	else:
+		log_dir   =  Path().cwd() / __LOGS__ / cfg.exp_name  
+		buffer_dir = Path().cwd() / __LOGS__ / cfg.exp_name / 'buffer'
+		make_dir(buffer_dir)
 	env, agent, buffer = make_env(cfg), TDMPC(cfg), ReplayBuffer(cfg)
-	
+	#full_buffer = FullReplayBuffer(max(cfg.max_buffer_size, cfg.train_steps), cfg.obs_shape, cfg.action_shape)
+    
 	# Run training
-	L = logger.Logger(work_dir, cfg)
-	episode_idx, start_time = 0, time.time()
+	L = logger.Logger(log_dir, cfg)
+	episode_idx, start_time, eval_rewards = 0, time.time(), [-np.inf]
 	for step in range(0, cfg.train_steps+cfg.episode_length, cfg.episode_length):
 
 		# Collect trajectory
@@ -60,7 +69,10 @@ def train(cfg):
 		episode = Episode(cfg, obs)
 		while not episode.done:
 			action = agent.plan(obs, step=step, t0=episode.first)
-			obs, reward, done, _ = env.step(action.cpu().numpy())
+			next_obs, reward, done, _ = env.step(action.cpu().numpy())
+			pixel_obs = np.moveaxis(env.get_pixel(), -1, 0)
+			#full_buffer.add(obs, action.cpu().numpy(), reward, next_obs, done, pixel_obs)
+			obs = next_obs
 			episode += (obs, action, reward, done)
 		assert len(episode) == cfg.episode_length
 		buffer += episode
@@ -86,8 +98,14 @@ def train(cfg):
 
 		# Evaluate agent periodically
 		if env_step % cfg.eval_freq == 0:
-			common_metrics['episode_reward'] = evaluate(env, agent, cfg.eval_episodes, step, env_step, L.video)
+			eval_reward = evaluate(env, agent, cfg.eval_episodes, step, env_step, L.video)
+			common_metrics['episode_reward'] = eval_reward
 			L.log(common_metrics, category='eval')
+			if eval_reward > np.max(eval_rewards):
+				L.save(agent)
+			eval_rewards.append(eval_reward) 
+		#if full_buffer.idx%10000 == 0 and full_buffer.idx > 0:
+			#full_buffer.save(buffer_dir)       
 
 	L.finish(agent)
 	print('Training completed successfully')
