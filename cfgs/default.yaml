@@ -22,8 +22,8 @@ horizon: 5
 reward_coef: 0.5
 value_coef: 0.1
 consistency_coef: 2
-inv_consistency_coef: 0
-act_reconstruct_coef: 1
+inv_consistency_coef: 2
+act_reconstruct_coef: 5
 rho: 0.5
 kappa: 0.1
 lr: 1e-3

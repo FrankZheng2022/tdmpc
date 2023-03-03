@@ -6,6 +6,7 @@ import algorithm.helper as h
 from torch.nn.functional import normalize
 
 class TOLD(nn.Module):
+<<<<<<< HEAD
     """Task-Oriented Latent Dynamics (TOLD) model used in TD-MPC."""
     def __init__(self, cfg):
         super().__init__()
@@ -333,3 +334,4 @@ class TDMPC():
                 'weighted_loss': float(weighted_loss.mean().item()),
                 'grad_norm': float(grad_norm),
                 }
+

@@ -63,6 +63,7 @@ def train(cfg):
     # Run training
     L = logger.Logger(log_dir, cfg)
     episode_idx, start_time, eval_rewards = 0, time.time(), [-np.inf]
+
     for step in range(0, cfg.train_steps+cfg.episode_length, cfg.episode_length):
 
         # Collect trajectory
