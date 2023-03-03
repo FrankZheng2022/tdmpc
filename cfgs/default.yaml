@@ -4,7 +4,7 @@ modality: 'state'
 action_repeat: ???
 discount: 0.99
 episode_length: 1000/${action_repeat}
-train_steps: 500000/${action_repeat}
+train_steps: 4000000/${action_repeat}
 
 # planning
 iterations: 6
@@ -22,6 +22,8 @@ horizon: 5
 reward_coef: 0.5
 value_coef: 0.1
 consistency_coef: 2
+inv_consistency_coef: 0
+act_reconstruct_coef: 1
 rho: 0.5
 kappa: 0.1
 lr: 1e-3
@@ -38,6 +40,7 @@ tau: 0.01
 enc_dim: 256
 mlp_dim: 512
 latent_dim: 50
+latent_action_dim: 4
 
 # wandb (insert your own)
 use_wandb: false
@@ -47,7 +50,7 @@ wandb_entity: none
 # misc
 seed: 1
 exp_name: default
-eval_freq: 20000
+eval_freq: 10000
 eval_episodes: 10
-save_video: false
-save_model: false
+save_video: true
+save_model: true

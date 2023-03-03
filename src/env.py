@@ -237,7 +237,7 @@ class TimeStepToGymWrapper(object):
 		time_step = self.env.step(action)
 		return self._obs_to_array(time_step.observation), time_step.reward, time_step.last() or self.t == self.ep_len, defaultdict(float)
 
-	def render(self, mode='rgb_array', width=384, height=384, camera_id=0):
+	def render(self, mode='rgb_array', width=84, height=84, camera_id=0):
 		camera_id = dict(quadruped=2).get(self.domain, camera_id)
 		return self.env.physics.render(height, width, camera_id)
 
@@ -249,6 +249,9 @@ class DefaultDictWrapper(gym.Wrapper):
 	def step(self, action):
 		obs, reward, done, info = self.env.step(action)
 		return obs, reward, done, defaultdict(float, info)
+    
+	def get_pixel(self):
+		return self.render(**self.render_kwargs)
 
 
 def make_env(cfg):
@@ -266,11 +269,11 @@ def make_env(cfg):
 	env = ActionDTypeWrapper(env, np.float32)
 	env = ActionRepeatWrapper(env, cfg.action_repeat)
 	env = action_scale.Wrapper(env, minimum=-1.0, maximum=+1.0)
-
+    
+	camera_id = dict(quadruped=2).get(domain, 0)
+	render_kwargs = dict(height=84, width=84, camera_id=camera_id)
 	if cfg.modality=='pixels':
 		if (domain, task) in suite.ALL_TASKS:
-			camera_id = dict(quadruped=2).get(domain, 0)
-			render_kwargs = dict(height=84, width=84, camera_id=camera_id)
 			env = pixels.Wrapper(env,
 								pixels_only=True,
 								render_kwargs=render_kwargs)
@@ -278,6 +281,7 @@ def make_env(cfg):
 	env = ExtendedTimeStepWrapper(env)
 	env = TimeStepToGymWrapper(env, domain, task, cfg.action_repeat, cfg.modality)
 	env = DefaultDictWrapper(env)
+	env.render_kwargs = render_kwargs
 
 	# Convenience
 	cfg.obs_shape = tuple(int(x) for x in env.observation_space.shape)
@@ -285,3 +289,4 @@ def make_env(cfg):
 	cfg.action_dim = env.action_space.shape[0]
 
 	return env
+
