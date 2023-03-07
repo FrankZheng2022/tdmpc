@@ -6,18 +6,22 @@ import algorithm.helper as h
 from torch.nn.functional import normalize
 
 class TOLD(nn.Module):
-<<<<<<< HEAD
     """Task-Oriented Latent Dynamics (TOLD) model used in TD-MPC."""
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
         self._encoder = h.enc(cfg)
-        self._action_encoder = h.mlp(cfg.action_dim, cfg.mlp_dim, cfg.latent_action_dim)
-        #self._action_encoder = nn.Identity()
-        self._action_decoder = h.mlp(cfg.latent_action_dim + cfg.latent_dim, cfg.mlp_dim, cfg.action_dim)
+        self.act_rep = True if cfg.act_rep != 0 else False
+        if self.act_rep:
+            self._action_encoder = h.mlp(cfg.action_dim, cfg.mlp_dim, cfg.latent_action_dim)
+            self._action_decoder = h.mlp(cfg.action_dim + cfg.latent_dim, cfg.mlp_dim, cfg.action_dim)
+        else:
+            self._action_encoder=nn.Identity()
+            self.cfg.act_reconstruct_coef = 0
+            self.cfg.inv_consistency_coef = 0
         self._dynamics = h.mlp(cfg.latent_dim+cfg.latent_action_dim, cfg.mlp_dim, cfg.latent_dim)
         self._inverse_dynamics = h.mlp(cfg.latent_dim*2, cfg.mlp_dim, cfg.latent_action_dim)
-        self._reward = h.mlp(cfg.latent_dim+cfg.latent_action_dim, cfg.mlp_dim, 1)
+        self._reward = h.mlp(cfg.latent_dim+cfg.action_dim, cfg.mlp_dim, 1)
         self._pi = h.mlp(cfg.latent_dim, cfg.mlp_dim, cfg.latent_action_dim)
         self._Q1, self._Q2 = h.q(cfg), h.q(cfg)
         self.apply(h.orthogonal_init)
@@ -40,12 +44,10 @@ class TOLD(nn.Module):
 
     def next(self, z, u):
         """Predicts next latent state (d) and single-step reward (R)."""
-        x = torch.cat([z, u], dim=-1)
-        return self._dynamics(x), self._reward(x)
-
-    # def reward(self, z, a):
-    # 	x = torch.cat([z, a], dim=-1)
-    # 	return self._org_reward(x)
+        a = self.decode_action(z.detach(), u)
+        x1 = torch.cat([z, u], dim=-1)
+        x2 = torch.cat([z, a], dim=-1)
+        return self._dynamics(x1), self._reward(x2)
 
     def prev_act(self, prev_z, z):
         """Predicts previous latent action"""
@@ -59,17 +61,20 @@ class TOLD(nn.Module):
             std = torch.ones_like(mu) * std
             return h.TruncatedNormal(mu, std).sample(clip=0.3)
         return mu
-
+    
     def Q(self, z, u):
-        """Predict state-action value (Q)."""  
+        """Predict state-action value (Q).""" 
+        u = self.decode_action(z.detach(), u)
         x = torch.cat([z, u], dim=-1)
         return self._Q1(x), self._Q2(x)
 
     def decode_action(self, z, u):
         """Return Raw Action"""  
-        x = torch.cat([z, u], dim=-1)
-        return self._action_decoder(x)
-        #return u
+        if self.act_rep:
+            x = torch.cat([z, u], dim=-1)
+            return self._action_decoder(x)
+        else:
+            return u
 
 class TDMPC():
     """Implementation of TD-MPC learning + inference."""
@@ -286,7 +291,6 @@ class TDMPC():
             u = self.model.f(action[t])
             Q1, Q2 = self.model.Q(z, u)
             z, reward_pred = self.model.next(z, u)
-            #org_reward_pred = self.model.reward(z, action[t])
             with torch.no_grad():                
                 next_obs = self.aug(next_obses[t])
                 next_z = self.model_target.h(next_obs)
@@ -302,7 +306,7 @@ class TDMPC():
             inv_consistency_loss += rho * torch.mean(h.mse(u_predict, u), dim=1, keepdim=True)
             act_reconstruct_loss += rho * torch.mean(h.mse(action[t], action_reconstruct), dim=1, keepdim=True)
             reward_loss += rho * h.mse(reward_pred, reward[t])
-            value_loss += rho * (h.mse(Q1, td_target) + h.mse(Q2, td_target))
+            value_loss  += rho * (h.mse(Q1, td_target) + h.mse(Q2, td_target))
             priority_loss += rho * (h.l1(Q1, td_target) + h.l1(Q2, td_target))
         # Optimize model
         total_loss = self.cfg.act_reconstruct_coef * act_reconstruct_loss.clamp(max=1e4) + \
@@ -334,4 +338,5 @@ class TDMPC():
                 'weighted_loss': float(weighted_loss.mean().item()),
                 'grad_norm': float(grad_norm),
                 }
+
 
